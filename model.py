@@ -10,18 +10,21 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
-def new_gelu(x):
+def swiglu(x):
     """
-    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
-    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    Implementation of the SwiGLU activation function.
+    Reference: "SwiGLU: A Gated Linear Unit Activation Function for Neural Networks" paper: https://arxiv.org/abs/2106.10818
     """
-    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+    swish = x * torch.sigmoid(x)
+    gate = torch.sigmoid(x)
+    return swish * gate
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -57,11 +60,16 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
+        self.rotary_emb = RotaryEmbedding(config.n_embd)
+
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+
+        q, k = self.rotary_emb(q, k)
+
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -83,6 +91,79 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+@torch.jit.script
+def apply_rotary_pos_emb(x, cos, sin):
+    # Handle a possible sequence length mismatch in between q and k
+    cos = cos[:, :, : x.shape[-2], :]
+    sin = sin[:, :, : x.shape[-2], :]
+    return (x * cos) + (rotate_half(x) * sin)
+
+
+class RotaryEmbedding(torch.nn.Module):
+    """
+    The rotary position embeddings from RoFormer_ (Su et. al).
+    A crucial insight from the method is that the query and keys are
+    transformed by rotation matrices which depend on the relative positions.
+    Other implementations are available in the Rotary Transformer repo_ and in
+    GPT-NeoX_, GPT-NeoX was an inspiration
+    .. _RoFormer: https://arxiv.org/abs/2104.09864
+    .. _repo: https://github.com/ZhuiyiTechnology/roformer
+    .. _GPT-NeoX: https://github.com/EleutherAI/gpt-neox
+    .. warning: Please note that this embedding is not registered on purpose, as it is transformative
+        (it does not create the embedding dimension) and will likely be picked up (imported) on a ad-hoc basis
+    """
+
+    def __init__(self, dim_model: int, *_, **__):
+        super().__init__()
+        # Generate and save the inverse frequency buffer (non trainable)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim_model, 2).float() / dim_model))
+        self.register_buffer("inv_freq", inv_freq)
+
+        self._seq_len_cached = None
+        self._cos_cached = None
+        self._sin_cached = None
+
+    def _update_cos_sin_tables(self, x, seq_dimension=1):
+        seq_len = x.shape[seq_dimension]
+
+        # Reset the tables if the sequence length has changed,
+        # or if we're on a new device (possibly due to tracing for instance)
+        if (
+            seq_len != self._seq_len_cached
+            or self._cos_cached.device != x.device
+            or self._cos_cached.dtype != x.dtype
+        ):
+            self._seq_len_cached = seq_len
+            t = torch.arange(
+                x.shape[seq_dimension], device=x.device, dtype=torch.float32
+            )
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(x.dtype))
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+
+            self._cos_cached = emb.cos()[None, None, :, :].to(x.dtype)
+            self._sin_cached = emb.sin()[None, None, :, :].to(x.dtype)
+
+        return self._cos_cached, self._sin_cached
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._cos_cached, self._sin_cached = self._update_cos_sin_tables(
+            k, seq_dimension=-2
+        )
+
+        return (
+            apply_rotary_pos_emb(q, self._cos_cached, self._sin_cached),
+            apply_rotary_pos_emb(k, self._cos_cached, self._sin_cached),
+        )
+
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -93,7 +174,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = new_gelu(x)
+        x = swiglu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -132,7 +213,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            #wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -162,8 +243,8 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+        #if non_embedding:
+        #    n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -182,8 +263,8 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        #pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = self.transformer.drop(tok_emb) # + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)

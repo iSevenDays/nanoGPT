@@ -15,6 +15,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from standalone_hyena import HyenaOperator, PositionalEmbedding, ExponentialModulation
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def swiglu(x):
@@ -179,6 +180,26 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+
+class HyenaBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn_free = HyenaOperator(
+            d_model=config.n_embd,
+            l_max=config.block_size,
+            order=2,
+            filter_order=64)
+        self.ln2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn_free(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -202,6 +223,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rotary: bool = False # rotary attention network
+    hyena: bool = True # attention free network
 
 class GPT(nn.Module):
 
@@ -211,13 +234,22 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            #wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        if config.rotary:
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                #wpe = nn.Embedding(config.block_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
+        elif config.hyena:
+            self.transformer = nn.ModuleDict(dict(
+                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                wpe = nn.Embedding(config.block_size, config.n_embd),
+                drop=nn.Dropout(config.dropout),
+                h = nn.ModuleList([HyenaBlock(config) for _ in range(config.n_layer)]),
+                ln_f=LayerNorm(config.n_embd, bias=config.bias),
+            ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -263,8 +295,11 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        #pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb) # + pos_emb)
+        if self.config.hyena or not self.config.rotary:
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
+        elif self.config.rotary:
+            x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -279,6 +314,33 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
+
+    def perplexity(self, idx, targets=None):
+        """Basically the same computation of the loss as in forward method, so no reason to use it. The metrics are correlated"""
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the negative log-likelihood
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            nll = loss * targets.size(1)  # multiply by sequence length to get the total NLL
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
+            nll = None
+
+        return logits, nll
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -360,6 +422,10 @@ class GPT(nn.Module):
         no_decay = set()
         whitelist_weight_modules = (torch.nn.Linear, )
         blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
+        if self.config.hyena:
+            whitelist_weight_modules = ()
+            blacklist_weight_modules = (
+            torch.nn.Linear, torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding, PositionalEmbedding, ExponentialModulation)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
                 fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
@@ -375,6 +441,8 @@ class GPT(nn.Module):
                 elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
                     # weights of blacklist modules will NOT be weight decayed
                     no_decay.add(fpn)
+                elif self.config.hyena:
+                    no_decay.add(fpn)
 
         # subtle: 'transformer.wte.weight' and 'lm_head.weight' are tied, so they
         # will appear in the no_decay and decay sets respectively after the above.
@@ -382,7 +450,10 @@ class GPT(nn.Module):
         # will only return the first occurence, key'd by 'transformer.wte.weight', below.
         # so let's manually remove 'lm_head.weight' from decay set. This will include
         # this tensor into optimization via transformer.wte.weight only, and not decayed.
-        decay.remove('lm_head.weight')
+        if 'lm_head.weight' in decay:
+            decay.remove('lm_head.weight')
+        elif self.config.hyena:
+            no_decay.remove('lm_head.weight')
 
         # validate that we considered every parameter
         param_dict = {pn: p for pn, p in self.named_parameters()}

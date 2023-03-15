@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from standalone_hyena import HyenaOperator, PositionalEmbedding, ExponentialModulation
 
-# @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
+@torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def swiglu(x):
     """
     Implementation of the SwiGLU activation function.

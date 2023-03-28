@@ -23,23 +23,6 @@ def fftconv(u, k, D):
     out = y + u * D.unsqueeze(-1)
     return out.to(dtype=u.dtype)
 
-def fftconv_mps(u, k, bias):
-    seqlen = u.shape[-1]
-    fft_size = 2 * seqlen
-
-    k_c = torch.view_as_complex(k)
-    u = torch.cat([u, torch.zeros_like(u)], dim=-1)
-    u_c = torch.view_as_complex(u)
-
-    y_c = torch.fft.fft(u_c, n=fft_size, dim=-1)
-    y_c = y_c * k_c[..., :fft_size // 2 + 1]
-    y_c[..., 0] /= 2
-    y_c[..., -1] /= 2
-    y = torch.fft.ifft(y_c, dim=-1)[..., :seqlen].real
-    y = y + bias
-    return y
-
-
 
 @torch.jit.script
 def mul_sum(q, y):
@@ -155,7 +138,7 @@ class HyenaFilter(OptimModule):
         self.d_model = d_model
         self.use_bias = bias
         self.fused_fft_conv = fused_fft_conv
-        self.bias = nn.Parameter(torch.randn(self.d_model))
+        self.bias = nn.Parameter(torch.randn(self.d_model).to(dtype=torch.float16)) # set bias to float16
         self.dropout = nn.Dropout(dropout)
         self.mps_fallback = torch.backends.mps.is_available() # MPS doesn't support fft methods
 
@@ -191,7 +174,7 @@ class HyenaFilter(OptimModule):
         return h
 
     def forward(self, x, L, k=None, bias=None, *args, **kwargs):
-        if k is None: k = self.filter(L)
+        if k is None: k = self.filter(L).to(x.dtype)
 
         # Ensure compatibility with filters that return a tuple
         k = k[0] if type(k) is tuple else k
@@ -205,7 +188,7 @@ class HyenaFilter(OptimModule):
 
         if mps_workaround:
             y = y.to('mps')
-        return y
+        return y.to(dtype=torch.float16)
 
 
 class HyenaOperator(nn.Module):
@@ -278,7 +261,7 @@ class HyenaOperator(nn.Module):
 
 
 if __name__ == "__main__":
-    device = 'cpu'
+    device = 'mps'
     layer = HyenaOperator(
         d_model=512,
         l_max=1024,

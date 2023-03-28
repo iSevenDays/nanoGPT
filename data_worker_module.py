@@ -1,44 +1,22 @@
+import concurrent
+import itertools
+import multiprocessing
 import os
 import pickle
+import random
 import re
-import string
-from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
-from typing import List
+from multiprocessing import Manager
 
-from langdetect import detect_langs
-from nltk.corpus import stopwords
-from nltk.tokenize import sent_tokenize
-from nltk.tokenize import word_tokenize
-
-english_stop_words = set(stopwords.words('english'))
-russian_stop_words = set(stopwords.words('russian'))
 import msgpack
-from datasets import IterableDataset
-from tqdm import tqdm
+from datasets import Dataset
 from transformers import GPT2Tokenizer
-from nltk.stem import WordNetLemmatizer
+
+from IrrelevantChecker import TextRelevanceChecker
+from text_cleaner import TextCleaner
 
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 BUFFER_SIZE = 10000
-block_size = 1024
-MAX_LENGTH = block_size
-import random
-
-
-class TextRelevanceChecker(ABC):
-    @abstractmethod
-    def is_relevant(self, text: str) -> bool:
-        pass
-
-
-class IrrelevantChecker(TextRelevanceChecker):
-    def __init__(self, is_irrelevant_function):
-        self.is_irrelevant_function = is_irrelevant_function
-
-    def is_relevant(self, text: str) -> bool:
-        return not self.is_irrelevant_function(text)
 
 
 def load_from_file(file_path):
@@ -51,94 +29,24 @@ def load_from_file(file_path):
         with open(file_path, 'rb') as f:
             return pickle.load(f)
 
-class CachedDataLoader:
-    def __init__(self, datasets: List[str], train_queue, validation_queue,
-                 parallel: bool = True,
-                 cache_dir='cache'):
-        self.validation_dataset = None
-        self.train_dataset = None
-        self.parallel = parallel
-        self.train_queue = train_queue
-        self.validation_queue = validation_queue
-        self.debug = False
-        self.parallel = parallel
-        self.cache_dir = cache_dir
-        self.datasets = datasets
-
-        if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir)
-
-        # Initialize datasets and create cache files for each dataset
-        self.init_default_datasets()
-
-    def init_default_datasets(self):
-        for dataset_name in self.datasets:
-            self.init_datasets(dataset_name)
-
-    def init_datasets(self, dataset_name):
-        # Create cache files for each dataset
-        cache_dir = 'cache'
-        if not os.path.exists(cache_dir):
-            raise Exception('cache not found')
-
-        train_cache_file = os.path.join(self.cache_dir, f"{dataset_name}_train_cache.pkl")
-        validation_cache_file = os.path.join(self.cache_dir, f"{dataset_name}_validation_cache.pkl")
-
-        self.load_items_from_cache(self.train_queue, train_cache_file)
-        self.load_items_from_cache(self.validation_queue, validation_cache_file)
-        print(f"{dataset_name} Train queue length: {self.train_queue.qsize()}")
-        print(f"{dataset_name} Validation queue length: {self.validation_queue.qsize()}")
-
-    def get_random_item(self, queue: Queue):
-        queue_list = list(queue.queue)
-        random_item = random.choice(queue_list)
-        queue.queue.remove(random_item)
-        return random_item
-
-    def get_train_item(self, timeout=None):
-        return self.get_item(self.train_queue, timeout=timeout)
-
-    def get_validation_item(self, timeout=None):
-        return self.get_item(self.validation_queue, timeout=timeout)
-
-    def get_item(self, queue, timeout=None, random_item=False):
-        if queue.qsize() == 0:
-            print('Will reload datasets, reason: queue is empty')
-            self.init_default_datasets()
-        if random_item:
-            item = self.get_random_item(queue)
-        else:
-            item = queue.get(timeout=timeout)
-
-        return item
-
-    def load_items_from_cache(self, queue, cache_file_path):
-        cached_data = load_from_file(cache_file_path)
-        if cached_data:
-            random.shuffle(cached_data)
-            for chunk_ids in cached_data:
-                queue.put(chunk_ids)
-
 
 class DataWorker:
     def __init__(self, relevance_checker: TextRelevanceChecker,
-                 datasets: dict[str, IterableDataset], train_queue, validation_queue,
+                 datasets: dict[str, Dataset],
                  block_size: int = 1024, buffer_size: int = 100_000, parallel: bool = True,
-                 train_queue_max_size=500,
-                 validation_queue_max_size=500,
                  prefetch_items_count=1000000,
                  cache_dir='cache',
                  load_cached_data=True):
         self.validation_dataset = None
         self.train_dataset = None
         self.relevance_checker = relevance_checker
-        self.block_size = block_size
         self.buffer_size = buffer_size
         self.parallel = parallel
-        self.train_queue = train_queue
-        self.validation_queue = validation_queue
-        self.train_queue_max_size = train_queue_max_size
-        self.validation_queue_max_size = validation_queue_max_size
+        self.train_lists = {}
+        self.validation_lists = {}
+        self.train_lists_locks = {}
+        self.validation_lists_locks = {}
+        self.output_queue = multiprocessing.Manager().Queue()
         self.running = False
         self.debug = False
         self.load_cached_data = load_cached_data
@@ -153,7 +61,10 @@ class DataWorker:
         self.train_cache_files = {}
         self.validation_cache_files = {}
         self.datasets = datasets
+        self.text_cleaner = TextCleaner()
+        self.stop_event = Manager().Event()
 
+        # self.seen_chunk_ids = {'train': {}, 'validation': {}}
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir)
 
@@ -165,15 +76,18 @@ class DataWorker:
             self.init_datasets(dataset_name, dataset)
 
     def init_datasets(self, dataset_name, dataset):
-        SEED = 42
-        TRAIN_RATIO = 0.8
+        split = dataset.train_test_split(test_size=0.2, seed=42)
 
-        train_dataset = dataset.filter(
-            lambda example: self.filter_data(example, SEED, TRAIN_RATIO)
-        )
-        validation_dataset = dataset.filter(
-            lambda example: not self.filter_data(example, SEED, TRAIN_RATIO)
-        )
+        train_dataset = split['train']
+        validation_dataset = split['test']
+
+        # self.seen_chunk_ids['train'][dataset_name] = set()
+        # self.seen_chunk_ids['validation'][dataset_name] = set()
+
+        self.train_lists[dataset_name] = Manager().list()
+        self.validation_lists[dataset_name] = Manager().list()
+        self.train_lists_locks[dataset_name] = Manager().Lock()
+        self.validation_lists_locks[dataset_name] = Manager().Lock()
 
         self.train_datasets[dataset_name] = train_dataset
         self.validation_datasets[dataset_name] = validation_dataset
@@ -187,10 +101,10 @@ class DataWorker:
         validation_cache_file = os.path.join(self.cache_dir, f"{dataset_name}_validation_cache.pkl")
 
         if self.load_cached_data:
-            self.load_items_from_cache(self.train_queue, train_cache_file)
-            self.load_items_from_cache(self.validation_queue, validation_cache_file)
-            print(f"{dataset_name} Train queue length: {self.train_queue.qsize()}")
-            print(f"{dataset_name} Validation queue length: {self.validation_queue.qsize()}")
+            self.load_items_from_cache(self.train_lists[dataset_name], train_cache_file, 'train', dataset_name)
+            self.load_items_from_cache(self.validation_lists[dataset_name], validation_cache_file, 'validation', dataset_name)
+            self.print(f"{dataset_name} Train queue length after loading cached data: {len(self.train_lists[dataset_name])}")
+            self.print(f"{dataset_name} Validation queue length after loading cached data: {len(self.validation_lists[dataset_name])}")
 
         self.train_cache_files[dataset_name] = train_cache_file
         self.validation_cache_files[dataset_name] = validation_cache_file
@@ -229,253 +143,152 @@ class DataWorker:
         ids.append(tokenizer.eos_token_id)
         return ids
 
+    # def process_texts(self, texts):
+    #     with ProcessPoolExecutor(max_workers=4) as executor:
+    #         relevant_chunks_ids = list(filter(None, executor.map(self.is_relevant_chunk, texts)))
+    #
+    #     return relevant_chunks_ids
     def process_texts(self, texts):
-        all_chunks = [list(self.chunk_text(text, self.block_size)) for text in texts]
-        all_chunks_flat = [chunk for chunks in all_chunks for chunk in chunks]
-        with ThreadPoolExecutor() as executor:
-            relevant_chunks_ids = list(filter(None, executor.map(self.is_relevant_chunk, all_chunks_flat)))
+        relevant_chunks_ids = []
+
+        for text in texts:
+            chunk_ids = self.is_relevant_chunk(text)
+            if chunk_ids is not None:
+                relevant_chunks_ids.append(chunk_ids)
 
         return relevant_chunks_ids
 
     def has_cyrillic(self, text):
         return bool(re.search('[\u0400-\u04FF]', text))
 
-    def clean_text(self, text):
-        # Remove or replace irrelevant or noisy information, such as non-textual characters or HTML tags
-        # Example:
-        cleaned_text = re.sub(r'<[^>]+>', ' ', text)  # Remove HTML tags
-        cleaned_text = re.sub(r'http\S+', ' ', cleaned_text)  # Remove URLs
-        cleaned_text = re.sub(r'@[^\s]+', ' ', cleaned_text)  # Remove mentions
-        cleaned_text = re.sub(r'\n', ' ', cleaned_text)  # Remove newline characters
-        cleaned_text = re.sub(r'[\r\u200b]', '', cleaned_text)  # Remove zero-width space and carriage return characters
-        cleaned_text = re.sub(r'["“”]', '"', cleaned_text)  # Replace double quotes with standard double quotes
-        cleaned_text = re.sub(r"[‘’´`]", "'", cleaned_text)  # Replace single quotes and apostrophes with standard single quotes
-        cleaned_text = re.sub(r'RT[\s]+', ' ', cleaned_text)  # Remove retweet prefix
-        cleaned_text = re.sub(r'#', '', cleaned_text)  # Remove hashtag symbol
-        cleaned_text = re.sub(r'[^\w\s-]', ' ', cleaned_text)  # Remove punctuation and special characters except hyphens
-        cleaned_text = re.sub(r'\d', ' ', cleaned_text)  # Remove digits
-        cleaned_text = re.sub(r'\s+', ' ', cleaned_text)  # Remove extra whitespace
-        cleaned_text = cleaned_text.strip()  # Remove leading and trailing whitespace
-
-        # Remove additional types of non-textual content that might be present in your data
-        cleaned_text = re.sub(r'\b\d{10}\b', ' ', cleaned_text)  # Remove phone numbers
-        cleaned_text = re.sub(r'\b@[^\s]+\b', ' ', cleaned_text)  # Remove social media handles
-
-        # Filter out sentences with overly complex vocabulary or rare words
-        tokens = word_tokenize(cleaned_text.lower())
-        cleaned_tokens = [token for token in tokens if token not in english_stop_words and token not in russian_stop_words]
-        vocab_size = len(set(cleaned_tokens))
-        if vocab_size / len(cleaned_tokens) < 0.4:
-            return None
-
-        lemmatizer = WordNetLemmatizer()
-        tokens = word_tokenize(cleaned_text.lower())
-        cleaned_tokens = [lemmatizer.lemmatize(token) for token in tokens if
-                          token not in english_stop_words and token not in russian_stop_words]
-        cleaned_text = " ".join(cleaned_tokens)
-
-        # Filter out texts with programming-related content
-        if re.search(r'\b(?:if|else|while|for|def|class|import|from|return|try|except|finally|raise|assert|yield|with)\b',
-                     cleaned_text, re.IGNORECASE):
-            return None
-
-        # Filter out short or incomplete sentences
-        sentences = sent_tokenize(cleaned_text)
-        cleaned_sentences = []
-        for sentence in sentences:
-            sentence_len = len(sentence)
-            if sentence_len < 5 or sentence[-1] not in ['.', '!', '?']:
-                continue
-            cleaned_sentences.append(sentence)
-        # Combine cleaned sentences into a single string
-        cleaned_text = ' '.join(cleaned_sentences)
-
-        main_language = 'en'
-        try:
-            detected_languages = detect_langs(text)
-            main_language = max(detected_languages, key=lambda x: x.prob).lang
-            if main_language != "en" and main_language != "ru":
-                return None
-        except Exception:
-            return None
-
-        stop_words = []
-        if main_language == 'en':
-            stop_words = set(stopwords.words('english'))
-        elif main_language == 'ru':
-            stop_words = set(stopwords.words('russian'))
-        tokens = word_tokenize(cleaned_text)
-        filtered_tokens = [token for token in tokens if token.lower() not in stop_words]
-        cleaned_text = ' '.join(filtered_tokens)
-
-        # Remove incomplete sentences and sentence fragments
-        if len(cleaned_text) < 20 or cleaned_text[-1] not in string.punctuation:
-            return None
-
-        # Remove incomplete words at the beginning or end of sentences
-        cleaned_text = re.sub(r'\b\w{1,2}\b', '', cleaned_text)
-
-        # Remove words containing non-alphabetic characters
-        cleaned_text = re.sub(r'\b\w*\d\w*\b', '', cleaned_text)
-
-        # Remove words containing only one character
-        cleaned_text = re.sub(r'\b\w{1}\b', '', cleaned_text)
-
-        # Remove lines with incomplete or missing target text
-        if ':' in cleaned_text and len(cleaned_text.split(':')[-1]) < 10:
-            return None
-
-        # Remove lines with incomplete or missing prompt text
-        if ':' in cleaned_text and len(cleaned_text.split(':')[-2]) < 10:
-            return None
-
-        if cleaned_text.count('.') <= 1:
-            return None
-        cleaned_text = cleaned_text.split('.')[:-1]
-        cleaned_text = '.'.join(cleaned_text)
-
-        cleaned_text = ' '.join(sentence for sentence in cleaned_text.split('.') if len(sentence.split()) > 1)
-
-        return cleaned_text
-
-    def process_data(self, data_queue, data_set, max_queue_size, label):
-        processed_texts_count = 0
-        batch_size = 300  # You can adjust this value as needed
-
-        if self.debug:
-            print(f'{label}: Start process data, qsize: {data_queue.qsize()}')
-
-        texts = []
-        i = 0
-        for d in data_set:
-            cleaned_text = self.clean_text(d['text'])
-            if cleaned_text is None:
-                continue
-            texts.append(cleaned_text)
-            if i % 50 == 0:
-                if self.debug:
-                    print(f'{label}: Processed {i} texts, qsize: {data_queue.qsize()}')
-
-            if len(texts) >= batch_size:
-                relevant_chunks_ids = self.process_texts(texts)
-                if self.debug:
-                    print(f'{label}: found {len(relevant_chunks_ids)} relevant chunks')
-                for chunk_ids in relevant_chunks_ids:
-                    if data_queue.qsize() >= max_queue_size:
-                        print(f'{label}: Processed texts: {processed_texts_count}, qsize: {data_queue.qsize()}')
-                        return
-                    data_queue.put(chunk_ids)
-                texts = []
-                processed_texts_count += batch_size
-            i += 1
-
-    def process_data_wrapper(self, args):
-        return self.process_data(*args)
-
-    def run(self):
-        self.running = True
-
-        if self.parallel:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                train_args = (self.train_queue, self.train_dataset, self.train_queue_max_size, 'train')
-                validation_args = (
-                    self.validation_queue, self.validation_dataset, self.validation_queue_max_size, 'validation')
-                executor.map(self.process_data_wrapper, [train_args, validation_args])
-        else:
-            self.process_data(self.train_queue, self.train_dataset, self.train_queue_max_size, 'train')
-            self.process_data(self.validation_queue, self.validation_dataset, self.validation_queue_max_size, 'validation')
-
-        if self.train_queue.qsize() == self.train_queue_max_size and self.validation_queue.qsize() == self.validation_queue_max_size:
-            print("Train and validation queues are full.")
-
-        self.running = False
-
-    def get_random_item(self, queue: Queue):
-        queue_list = list(queue.queue)
-        random_item = random.choice(queue_list)
-        queue.queue.remove(random_item)
-        return random_item
-
-    def get_train_item(self, timeout=None):
-        return self.get_item(self.train_queue, timeout=timeout)
-
-    def get_validation_item(self, timeout=None):
-        return self.get_item(self.validation_queue, timeout=timeout)
-
-    def get_item(self, queue, timeout=None, random_item=False):
-        if queue.qsize() == 0:
-            print('Will reload datasets, reason: queue is empty')
-            self.init_default_datasets()
-        if random_item:
-            item = self.get_random_item(queue)
-        else:
-            item = queue.get(timeout=timeout)
-
-        return item
-
-    def load_items_from_cache(self, queue, cache_file_path):
+    def load_items_from_cache(self, data_list, cache_file_path, label, dataset_name):
+        self.print(f'Loading file from cache for {label} for dataset_name {dataset_name}')
         cached_data = load_from_file(cache_file_path)
-        if cached_data:
+        if cached_data and len(cached_data) > 0:
+            self.print(f'Loading {len(cached_data)} items from cache for {label} for dataset_name {dataset_name}')
+        else:
+            self.print(f'Loaded no items from cache for {label} for dataset_name {dataset_name}')
+        # seen_chunk_ids = self.seen_chunk_ids[label][dataset_name]  # Get the seen_chunk_ids set for the dataset
+        if cached_data and len(cached_data) > 0:
             random.shuffle(cached_data)
-            for chunk_ids in cached_data:
-                queue.put(chunk_ids)
+            with Manager().Lock():
+                data_list.extend(cached_data)
 
     def prefetch_train(self, dataset_name):
         cache_file_path = self.train_cache_files[dataset_name]
         dataset = self.train_datasets[dataset_name]
-        self.prefetch_items(f'train_{dataset_name}', dataset, self.prefetch_items_count, self.train_queue, cache_file_path)
+
+        self.prefetch_items(label=f'train_{dataset_name}',
+                            dataset=dataset,
+                            dataset_name=dataset_name,
+                            num_items=self.prefetch_items_count,
+                            data_list=self.train_lists[dataset_name],
+                            cache_file_path=cache_file_path)
 
     def prefetch_validation(self, dataset_name):
         cache_file_path = self.validation_cache_files[dataset_name]
         dataset = self.validation_datasets[dataset_name]
-        self.prefetch_items(f'validation_{dataset_name}', dataset, self.prefetch_items_count, self.validation_queue,
-                            cache_file_path)
+        self.prefetch_items(label=f'validation_{dataset_name}',
+                            dataset=dataset,
+                            dataset_name=dataset_name,
+                            num_items=self.prefetch_items_count,
+                            data_list=self.validation_lists[dataset_name],
+                            cache_file_path=cache_file_path)
 
-    def prefetch_items(self, label, dataset, num_items, queue, cache_file_path):
-        print(f'Will prefetch {num_items} items for {label}, dataset: {dataset}, queue: {queue}')
-        i = 0
-        with tqdm(total=num_items, desc=f"Prefetching {label} items") as pbar:
-            for d in dataset:
-                if self.debug:
-                    print(f'Processing next item for {label}')
-                if queue.qsize() >= num_items:
-                    print(
-                        f'Stopping prefetching items for {label}, reason: queue.qsize() ({queue.qsize()}) >= num_items {num_items}')
-                    break
-                try:
-                    text = d['text']
-                except StopIteration:
-                    print(f'StopIteration encountered for {label}')
-                    break
-                relevant_chunks_ids = self.process_texts([text])
-                if not relevant_chunks_ids:
-                    if self.debug:
-                        print(f'No relevant chunks found for {label}')
-                for chunk_ids in relevant_chunks_ids:
-                    queue.put(chunk_ids)
-                    if queue.qsize() >= num_items:
-                        print(
-                            f'Queue size reached the limit for {label}: queue.qsize() ({queue.qsize()}) >= num_items {num_items}')
-                        break
-                    i += 1
-                    if i % 100 == 0:
-                        if self.debug:
-                            print(f'Saving intermediate results for {label} to cache file')
-                        self.save_to_file(cache_file_path, list(queue.queue))
-                # Update progress bar to the current queue.qsize()
-                pbar.update(queue.qsize() - pbar.n)
-            print(f'Finished processing all items for {label}')
-            self.save_to_file(cache_file_path, list(queue.queue))
+    def process_dataset_indices(self, args):
+        dataset, start_idx, end_idx, buffer_size = args
+        texts = [dataset[i]['text'] for i in range(start_idx, end_idx)]
+        text_buffer = []
+        relevant_chunks_ids_list = []
+
+        for text in texts:
+            if self.stop_event.is_set():
+                break
+            text_buffer.append(text)
+            if len(text_buffer) >= buffer_size:
+                relevant_chunks_ids_list.extend(self.process_texts(text_buffer))
+                text_buffer = []
+
+        if text_buffer:
+            relevant_chunks_ids_list.extend(self.process_texts(text_buffer))
+
+        return relevant_chunks_ids_list
+
+    def prefetch_items(self, label, dataset, dataset_name, num_items, data_list, cache_file_path):
+        self.print(f'Will prefetch {num_items} items for {label}, dataset: {dataset}, list: {data_list}')
+
+        num_workers = 4
+        buffer_size = 128
+        total_dataset_size = len(dataset)
+        subset_size = 10000  # Adjust this to the desired subset size
+        num_subsets = total_dataset_size // subset_size
+
+        for subset_idx in range(num_subsets + 1):
+            lock_file = f'cache/{dataset_name}_{label}_{subset_idx}.lock'
+            if os.path.exists(lock_file):
+                self.print(f'Skipping prefetch for {label} subset {subset_idx}, dataset: {dataset_name} - lock file exists')
+                continue
+            start_subset = subset_idx * subset_size
+            end_subset = min((subset_idx + 1) * subset_size, total_dataset_size)
+            subset = dataset.select(range(start_subset, end_subset))
+
+            chunk_size = max(len(subset) // num_workers, 1)  # Calculate chunk size for each worker
+            index_ranges = [(i * chunk_size, (i + 1) * chunk_size) for i in range(num_workers)]
+            index_ranges[-1] = (index_ranges[-1][0], len(subset))  # Make sure the last range includes the last element
+
+            # Process dataset in parallel
+            args_list = [(subset, start_idx, end_idx, buffer_size) for start_idx, end_idx in index_ranges]
+            self.print(f'Processing subset {subset_idx + 1} of {num_subsets + 1}')
+            self.print(f'Args list is prepared, len: {len(args_list)}')
+            lock = self.train_lists_locks[dataset_name] if label == 'train' else self.validation_lists_locks[dataset_name]
+            with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Submit tasks to the executor
+                futures = {executor.submit(self.process_dataset_indices, args): i for i, args in enumerate(args_list)}
+
+                for future in concurrent.futures.as_completed(futures):
+                    i = futures[future]  # Get the index of the completed future
+                    self.print(f'Processing chunk {i + 1} of {len(args_list)}')
+                    results = future.result()  # Get the result of the completed future
+
+                    # Merge and shuffle results
+                    relevant_chunks_ids_list = results
+                    random.shuffle(relevant_chunks_ids_list)
+
+                    # Add results to the queue
+                    self.print(f'Will add {len(relevant_chunks_ids_list)} new items to {label} list of {dataset_name}')
+
+                    if len(relevant_chunks_ids_list) == 0:
+                        continue
+                    with lock:
+                        data_list.extend(relevant_chunks_ids_list)
+
+            # Save current queue to cache file
+            with lock:
+                self.print(f'Will save list len({len(data_list)}) to {label} list of {dataset_name} to path {cache_file_path} ')
+            self.save_list_to_file(lst=data_list, file_path=cache_file_path, dataset_name=dataset_name, label=label)
+
+            # Create the lock file after processing is complete
+            with open(lock_file, 'w') as lockfile:
+                lockfile.write(f'Processed {lockfile}')
 
     def save_to_file(self, file_path, data):
         with open(file_path, 'wb') as f:
             msgpack.dump(data, f)
 
-    def remove_items_from_cache(self, file_path, items_to_remove):
-        cache = load_from_file(file_path)
-        if cache:
-            cache_set = set(tuple(item) for item in cache)
-            items_to_remove_set = set(tuple(item) for item in items_to_remove)
-            cache_set = cache_set - items_to_remove_set
-            cache = [list(item) for item in cache_set]
-            self.save_to_file(file_path, cache)
+    def stop(self):
+        self.stop_event.set()
+
+    def print(self, msg):
+        print(msg)
+        self.output_queue.put(msg)
+
+    def save_list_to_file(self, lst, file_path, label, dataset_name):
+        lock = self.train_lists_locks[dataset_name] if label == 'train' else self.validation_lists_locks[dataset_name]
+        with lock:  # Use a Lock from the Manager to synchronize access to the list
+            list_copy = list(lst)
+
+            # Save the list to the file
+            with open(file_path, 'wb') as f:
+                msgpack.dump(list_copy, f)
+
+
